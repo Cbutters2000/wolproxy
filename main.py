@@ -1,99 +1,73 @@
 import os
-import asyncio
+import logging
 from fastapi import FastAPI, Request
 from fastapi.responses import StreamingResponse, Response
 import httpx
 from wakeonlan import send_magic_packet
 
+logging.basicConfig(level=logging.INFO)
+log = logging.getLogger("proxy")
+
 app = FastAPI()
-
 TARGET_MAC = os.getenv("LM_STUDIO_MAC")
-TARGET_URL = f"http://{os.getenv('LM_STUDIO_IP')}:{os.getenv('LM_STUDIO_PORT', '1234')}"
-WAKE_TIMEOUT = float(os.getenv("WAKE_TIMEOUT", "180"))
-REQUEST_TIMEOUT = float(os.getenv("REQUEST_TIMEOUT", "600"))
+TARGET_HOST = os.getenv("LM_STUDIO_IP")
+TARGET_PORT = os.getenv("LM_STUDIO_PORT", "1234")
+TARGET_URL = f"http://{TARGET_HOST}:{TARGET_PORT}"
 
-HOP_BY_HOP = {
-    "connection", "keep-alive", "proxy-authenticate", "proxy-authorization",
+log.info("Upstream target: %s  MAC=%s", TARGET_URL, TARGET_MAC)
+
+client = httpx.AsyncClient(
+    timeout=httpx.Timeout(600.0, connect=10.0),
+    follow_redirects=True,
+)
+
+HOP = {
+    "host", "connection", "keep-alive", "proxy-authenticate", "proxy-authorization",
     "te", "trailers", "transfer-encoding", "upgrade", "content-length",
+    "accept-encoding", "content-encoding",
 }
 
-client = httpx.AsyncClient(timeout=httpx.Timeout(REQUEST_TIMEOUT, connect=10.0))
-
-
-def clean_headers(headers) -> dict:
-    return {k: v for k, v in headers.items() if k.lower() not in HOP_BY_HOP and k.lower() != "host"}
-
-
-async def wait_for_backend() -> bool:
-    deadline = asyncio.get_event_loop().time() + WAKE_TIMEOUT
-    while asyncio.get_event_loop().time() < deadline:
-        try:
-            r = await client.get(f"{TARGET_URL}/v1/models")
-            if r.status_code < 500:
-                return True
-        except httpx.RequestError:
-            pass
-        await asyncio.sleep(2)
-    return False
-
-
-@app.api_route("/{path:path}", methods=["GET", "POST", "PUT", "DELETE", "OPTIONS", "PATCH"])
+@app.api_route("/{path:path}", methods=["GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS"])
 async def proxy(request: Request, path: str):
     if TARGET_MAC:
         try:
             send_magic_packet(TARGET_MAC)
         except Exception as e:
-            print(f"WoL Error: {e}")
-
-    if not await wait_for_backend():
-        return Response(
-            content="Proxy Error: LM Studio did not come up after WoL",
-            status_code=502,
-        )
+            log.warning("WoL error: %s", e)
 
     clean_path = path.lstrip("/")
     url = f"{TARGET_URL}/{clean_path}" if clean_path else TARGET_URL
     if request.url.query:
         url = f"{url}?{request.url.query}"
 
+    headers = {}
+    if ct := request.headers.get("content-type"):
+        headers["content-type"] = ct
+    if auth := request.headers.get("authorization"):
+        headers["authorization"] = auth
+
     body = await request.body()
-    headers = clean_headers(request.headers)
+    log.info("%s %s -> %s (%d bytes)", request.method, request.url.path, url, len(body))
 
     try:
-        req = client.build_request(
-            method=request.method,
-            url=url,
-            content=body,
-            headers=headers,
-        )
-        response = await client.send(req, stream=True)
-
-        resp_headers = clean_headers(response.headers)
-        content_type = response.headers.get("content-type", "")
-
-        if "text/event-stream" in content_type.lower() or request.headers.get("accept", "").find("text/event-stream") >= 0:
-            async def stream_generator():
-                try:
-                    async for chunk in response.aiter_bytes():
-                        yield chunk
-                finally:
-                    await response.aclose()
-
-            return StreamingResponse(
-                stream_generator(),
-                status_code=response.status_code,
-                headers=resp_headers,
-                media_type="text/event-stream",
-            )
-
-        content = await response.aread()
-        await response.aclose()
-        return Response(content=content, status_code=response.status_code, headers=resp_headers)
-
+        req = client.build_request(request.method, url, content=body, headers=headers)
+        upstream = await client.send(req, stream=True)
     except httpx.RequestError as e:
-        return Response(content=f"Proxy Error: {e}", status_code=502)
+        log.exception("Upstream error talking to %s", url)
+        return Response(content=f"Proxy Error: {type(e).__name__}: {e}", status_code=502)
 
+    out_headers = {k: v for k, v in upstream.headers.items() if k.lower() not in HOP}
+    ctype = upstream.headers.get("content-type", "")
 
-if __name__ == "__main__":
-    import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=31234)
+    if "text/event-stream" in ctype.lower():
+        async def gen():
+            try:
+                async for chunk in upstream.aiter_bytes():
+                    yield chunk
+            finally:
+                await upstream.aclose()
+        return StreamingResponse(gen(), status_code=upstream.status_code, headers=out_headers, media_type="text/event-stream")
+
+    content = await upstream.aread()
+    await upstream.aclose()
+    return Response(content=content, status_code=upstream.status_code, headers=out_headers)
