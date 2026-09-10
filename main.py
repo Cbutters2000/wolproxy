@@ -14,7 +14,7 @@ client = httpx.AsyncClient()
 
 @app.api_route("/{path:path}", methods=["GET", "POST", "PUT", "DELETE"])
 async def proxy(request: Request, path: str):
-    # 1. Wake up the machine immediately! ⚡️
+    # 1. Wake up the machine immediately!
     if TARGET_MAC:
         try:
             send_magic_packet(TARGET_MAC)
