@@ -1,73 +1,79 @@
 import os
-import logging
 from fastapi import FastAPI, Request
 from fastapi.responses import StreamingResponse, Response
 import httpx
 from wakeonlan import send_magic_packet
 
-logging.basicConfig(level=logging.INFO)
-log = logging.getLogger("proxy")
-
 app = FastAPI()
+
 TARGET_MAC = os.getenv("LM_STUDIO_MAC")
-TARGET_HOST = os.getenv("LM_STUDIO_IP")
-TARGET_PORT = os.getenv("LM_STUDIO_PORT", "1234")
-TARGET_URL = f"http://{TARGET_HOST}:{TARGET_PORT}"
+# Fixed the syntax error from before! No stray quotes! ✅
+TARGET_URL = f"http://{os.getenv('LM_STUDIO_IP')}:{os.getenv('LM_STUDIO_PORT', '1234')}"
 
-log.info("Upstream target: %s  MAC=%s", TARGET_URL, TARGET_MAC)
+client = httpx.AsyncClient(timeout=httpx.Timeout(60.0, connect=10.0))
 
-client = httpx.AsyncClient(
-    timeout=httpx.Timeout(600.0, connect=10.0),
-    follow_redirects=True,
-)
-
-HOP = {
-    "host", "connection", "keep-alive", "proxy-authenticate", "proxy-authorization",
-    "te", "trailers", "transfer-encoding", "upgrade", "content-length",
-    "accept-encoding", "content-encoding",
-}
-
-@app.api_route("/{path:path}", methods=["GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS"])
+@app.api_route("/{path:path}", methods=["GET", "POST", "PUT", "DELETE"])
 async def proxy(request: Request, path: str):
+    # 1. Wake up the machine! ⚡️
     if TARGET_MAC:
         try:
             send_magic_packet(TARGET_MAC)
         except Exception as e:
-            log.warning("WoL error: %s", e)
+            print(f"WoL Error: {e}")
 
+    # Clean the path to avoid double slashes 🥖
     clean_path = path.lstrip("/")
-    url = f"{TARGET_URL}/{clean_path}" if clean_path else TARGET_URL
-    if request.url.query:
-        url = f"{url}?{request.url.query}"
 
-    headers = {}
-    if ct := request.headers.get("content-type"):
-        headers["content-type"] = ct
-    if auth := request.headers.get("authorization"):
-        headers["authorization"] = auth
+    # Build URL carefully. If it's the root, don't add a slash!
+    if clean_path:
+        url = f"{TARGET_URL}/{clean_path}"
+    else:
+        url = TARGET_URL
 
     body = await request.body()
-    log.info("%s %s -> %s (%d bytes)", request.method, request.url.path, url, len(body))
+
+    # 2. Sanitize headers! 🧹
+    # We strip out 'host', 'content-length', and 'transfer-encoding' because httpx will calculate those for us.
+    # Sending them manually often causes "Bad Gateway" errors!
+    headers = dict(request.headers)
+
+    headers_to_remove = ["host", "content-length", "transfer-encoding", "connection"]
+    for h in headers_to_remove:
+        headers.pop(h, None)
+
+    print(f"--- PROXY REQUEST ---")
+    print(f"Method: {request.method}")
+    print(f"URL: {url}") # <--- Check your logs to see if this looks right!
 
     try:
-        req = client.build_request(request.method, url, content=body, headers=headers)
-        upstream = await client.send(req, stream=True)
+        # Try streaming first (for chat completions) 🌊
+        async with client.stream(method=request.method, url=url, content=body, headers=headers) as response:
+
+            # If LM Studio says "this is a stream", we stream it back.
+            if "text/event-stream" in response.headers.get("content-type", "").lower():
+                async def stream_generator():
+                    async for chunk in response.aiter_bytes():
+                        yield chunk
+
+                return StreamingResponse(stream_generator(), status_code=response.status_code, headers=dict(response.headers))
+
+            # Otherwise, read the whole thing and send it back.
+            content = await response.aread()
+            return Response(content=content, status_code=response.status_code, headers=dict(response.headers))
+
     except httpx.RequestError as e:
-        log.exception("Upstream error talking to %s", url)
-        return Response(content=f"Proxy Error: {type(e).__name__}: {e}", status_code=502)
+        print(f"!!! CRITICAL PROXY ERROR !!!")
+        print(f"Exception: {e}") # <--- This will tell us exactly what broke!
 
-    out_headers = {k: v for k, v in upstream.headers.items() if k.lower() not in HOP}
-    ctype = upstream.headers.get("content-type", "")
+        # If the stream failed for some reason (maybe it wasn't a stream after all?),
+        # try one last time without streaming.
+        try:
+            final_response = await client.request(method=request.method, url=url, content=body, headers=headers)
+            return Response(content=final_response.content, status_code=final_response.status_code)
+        except Exception as e2:
+             print(f"!!! FALLBACK ALSO FAILED !!!") # <--- If you see this in logs... we are in trouble!
+             return Response(content=f"Proxy Error: {e}", status_code=502)
 
-    if "text/event-stream" in ctype.lower():
-        async def gen():
-            try:
-                async for chunk in upstream.aiter_bytes():
-                    yield chunk
-            finally:
-                await upstream.aclose()
-        return StreamingResponse(gen(), status_code=upstream.status_code, headers=out_headers, media_type="text/event-stream")
-
-    content = await upstream.aread()
-    await upstream.aclose()
-    return Response(content=content, status_code=upstream.status_code, headers=out_headers)
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=31234)
