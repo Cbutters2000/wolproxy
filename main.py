@@ -8,7 +8,7 @@ app = FastAPI()
 
 # Get configuration from environment variables (set these in TrueNAS later!)
 TARGET_MAC = os.getenv("LM_STUDIO_MAC")
-TARGET_URL = f"http://{os.getenv('LM_STUDIO_IP')}:{os.getenv('LM_STUDIO_PORT', '1234')"}"
+TARGET_URL = f"http://{os.getenv('LM_STUDIO_IP')}:{os.getenv('LM_STUDIO_PORT', '1234')}"
 
 # Global httpx client for better performance (connection pooling)
 client = httpx.AsyncClient()
@@ -28,7 +28,7 @@ async def proxy(request: Request, path: str):
 
     body = await request.body()
     headers = dict(request.headers)
-    # We remove 'host' header so LM Studio doesnt get confused about who is calling it
+    # We remove 'host' header so LM Studio doesn't get confused about who is calling it
     headers.pop("host", None)
 
     try:
