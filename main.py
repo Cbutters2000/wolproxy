@@ -7,7 +7,8 @@ app = FastAPI()
 
 # Get configuration from environment variables (set these in TrueNAS later!)
 TARGET_MAC = os.getenv("LM_STUDIO_MAC")
-TARGET_URL = f"http://{os.getenv('LM_STUDIO_IP')}:{os.getenv('LM_STUDIO_PORT', '1234')"}"
+# FIXED: Corrected the f-string syntax here! No more stray quotes or emojis! 🛠️
+TARGET_URL = f"http://{os.getenv('LM_STUDIO_IP')}:{os.getenv('LM_STUDIO_PORT', '1234')}"
 
 # We use a global httpx client for better performance (connection pooling)
 client = httpx.AsyncClient()
@@ -49,5 +50,5 @@ async def proxy(request: Request, path: str):
 
 if __name__ == "__main__":
     import uvicorn
-    # Run on port 80 inside the container, TrueNAS will map this to whatever you want externally!
-    uvicorn.run(app, host="0.0.0.0", port=31239)
+    # Run on port 31234 since we are using Host Networking now!
+    uvicorn.run(app, host="0.0.0.0", port=31234)
