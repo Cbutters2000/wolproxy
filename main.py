@@ -50,4 +50,4 @@ async def proxy(request: Request, path: str):
 if __name__ == "__main__":
     import uvicorn
     # Run on port 80 inside the container, TrueNAS will map this to whatever you want externally!
-    uvicorn.run(app, host="0.0.0.0", port=80)
+    uvicorn.run(app, host="0.0.0.0", port=31239)
