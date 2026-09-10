@@ -5,7 +5,7 @@ import httpx
 
 app = FastAPI()
 
-TARGET_URL = f"http://{os.getenv('LM_STUDIO_IP', '192.168.1.40')}:{os.getenv('LM_STUDIO_PORT', '1234')}/v1"
+TARGET_URL = f"http://{os.getenv('LM_STUDIO_IP', '192.168.1.40')}:{os.getenv('LM_STUDIO_PORT', '1234')}"
 TARGET_MAC = os.getenv('TARGET_MAC', '')
 
 # Wake-on-LAN helper
